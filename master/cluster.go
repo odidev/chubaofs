@@ -49,6 +49,8 @@ type Cluster struct {
 	volStatInfo               sync.Map
 	BadDataPartitionIds       *sync.Map
 	BadMetaPartitionIds       *sync.Map
+	MigratedMetaPartitionIds  *sync.Map
+	MigratedDataPartitionIds  *sync.Map
 	DisableAutoAllocate       bool
 	fsm                       *MetadataFsm
 	partition                 raftstore.Partition
@@ -66,6 +68,8 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.t = newTopology()
 	c.BadDataPartitionIds = new(sync.Map)
 	c.BadMetaPartitionIds = new(sync.Map)
+	c.MigratedDataPartitionIds = new(sync.Map)
+	c.MigratedMetaPartitionIds = new(sync.Map)
 	c.dataNodeStatInfo = new(nodeStatInfo)
 	c.metaNodeStatInfo = new(nodeStatInfo)
 	c.zoneStatInfos = make(map[string]*proto.ZoneStat)
@@ -894,8 +898,8 @@ func (c *Cluster) getAllMetaPartitionsByMetaNode(addr string) (partitions []*Met
 	return
 }
 
-func (c *Cluster) decommissionDataNode(dataNode *DataNode) (err error) {
-	msg := fmt.Sprintf("action[decommissionDataNode], Node[%v] OffLine", dataNode.Addr)
+func (c *Cluster) decommissionDataNode(dataNode *DataNode, strictFlag bool) (err error) {
+	msg := fmt.Sprintf("action[decommissionDataNode], Node[%v],strictMode[%v] OffLine", dataNode.Addr, strictFlag)
 	log.LogWarn(msg)
 	var wg sync.WaitGroup
 	dataNode.ToBeOffline = true
@@ -903,14 +907,16 @@ func (c *Cluster) decommissionDataNode(dataNode *DataNode) (err error) {
 	partitions := c.getAllDataPartitionByDataNode(dataNode.Addr)
 	errChannel := make(chan error, len(partitions))
 	defer func() {
-		dataNode.ToBeOffline = false
+		if err != nil {
+			dataNode.ToBeOffline = false
+		}
 		close(errChannel)
 	}()
 	for _, dp := range partitions {
 		wg.Add(1)
 		go func(dp *DataPartition) {
 			defer wg.Done()
-			if err1 := c.decommissionDataPartition(dataNode.Addr, dp, dataNodeOfflineErr); err1 != nil {
+			if err1 := c.decommissionDataPartition(dataNode.Addr, dp, dataNodeOfflineErr, strictFlag); err1 != nil {
 				errChannel <- err1
 			}
 		}(dp)
@@ -940,7 +946,9 @@ func (c *Cluster) delDataNodeFromCache(dataNode *DataNode) {
 	go dataNode.clean()
 }
 
-// Decommission a data partition.
+// Decommission a data partition.In strict mode, only if the size of the replica is equal,
+// or the number of files is equal, the recovery is considered complete. when it is triggered by migrated dataNode,
+// the strict mode is true,otherwise is false.
 // 1. Check if we can decommission a data partition. In the following cases, we are not allowed to do so:
 // - (a) a replica is not in the latest host list;
 // - (b) there is already a replica been taken offline;
@@ -950,7 +958,7 @@ func (c *Cluster) delDataNodeFromCache(dataNode *DataNode) {
 // 4. synchronized create a new data partition
 // 5. Set the data partition as readOnly.
 // 6. persistent the new host list
-func (c *Cluster) decommissionDataPartition(offlineAddr string, dp *DataPartition, errMsg string) (err error) {
+func (c *Cluster) decommissionDataPartition(offlineAddr string, dp *DataPartition, errMsg string, strictMode bool) (err error) {
 	var (
 		targetHosts     []string
 		newAddr         string
@@ -1013,7 +1021,11 @@ func (c *Cluster) decommissionDataPartition(offlineAddr string, dp *DataPartitio
 	}
 	dp.Status = proto.ReadOnly
 	dp.isRecover = true
-	c.putBadDataPartitionIDs(replica, offlineAddr, dp.PartitionID)
+	if strictMode {
+		c.putMigratedDataPartitionIDs(replica, offlineAddr, dp.PartitionID)
+	} else {
+		c.putBadDataPartitionIDs(replica, offlineAddr, dp.PartitionID)
+	}
 	dp.RLock()
 	c.syncUpdateDataPartition(dp)
 	dp.RUnlock()
@@ -1319,7 +1331,7 @@ func (c *Cluster) putBadDataPartitionIDs(replica *DataReplica, addr string, part
 	c.BadDataPartitionIds.Store(key, newBadPartitionIDs)
 }
 
-func (c *Cluster) decommissionMetaNode(metaNode *MetaNode) (err error) {
+func (c *Cluster) decommissionMetaNode(metaNode *MetaNode, strictMode bool) (err error) {
 	msg := fmt.Sprintf("action[decommissionMetaNode],clusterID[%v] Node[%v] begin", c.Name, metaNode.Addr)
 	log.LogWarn(msg)
 	var wg sync.WaitGroup
@@ -1335,7 +1347,7 @@ func (c *Cluster) decommissionMetaNode(metaNode *MetaNode) (err error) {
 		wg.Add(1)
 		go func(mp *MetaPartition) {
 			defer wg.Done()
-			if err1 := c.decommissionMetaPartition(metaNode.Addr, mp); err1 != nil {
+			if err1 := c.decommissionMetaPartition(metaNode.Addr, mp, strictMode); err1 != nil {
 				errChannel <- err1
 			}
 		}(mp)
